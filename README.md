@@ -71,8 +71,21 @@ pip install requests rsa
 ```
 QL-BD-CHECKIN/
 ├── baidu_pan_checkin.py   # 主签到脚本
+├── qr_login.py           # 扫码登录获取BDUSS工具
 ├── requirements.txt       # Python依赖
+├── GET_BDUSS.md          # BDUSS获取方法文档
 └── README.md             # 说明文档
+```
+
+## 获取 BDUSS
+
+首次使用需要获取 BDUSS，详见 [GET_BDUSS.md](GET_BDUSS.md)。
+
+推荐在本地电脑运行 `qr_login.py` 扫码登录自动获取：
+
+```bash
+pip install requests qrcode
+python3 qr_login.py
 ```
 
 ## 签到机制
