@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-百度网盘自动签到脚本 (青龙面板版)
+百度网盘自动签到脚本 (青龙面板版) v3.0
 ===================================
-功能：
-  1. 支持BDUSS Cookie认证（推荐，稳定可靠）
-  2. 支持账号密码登录（自动获取BDUSS，可能触发验证码）
-  3. 每日签到获取成长值
-  4. 查询用户信息（等级、成长值、到期时间等）
-  5. 支持多账号批量签到
-  6. 青龙面板通知推送
+更新说明：
+  v3.0 - 自动获取STOKEN（通过BDUSS调用PCS API）
+       - 使用 membership/user?method=query 获取会员信息
+       - 使用 membership/level?method=query 获取等级成长值
+       - 尝试 membership/user?method=sign 签到（百度可能随时恢复）
+       - 完善的错误处理和状态报告
+  v2.0 - 多策略签到方案
+  v1.0 - 基础签到功能
+
+重要说明：
+  百度网盘已于2024年底废弃了Web端签到API（membership/user?method=sign
+  返回200但空响应）。签到功能已迁移至百度网盘APP内。
+  本脚本仍会尝试调用签到API（以防百度恢复），同时提供
+  会员状态和成长值监控功能。
 
 环境变量：
   BDUSS         - BDUSS Cookie值，多账号用 & 或换行分隔（推荐）
+  STOKEN        - STOKEN Cookie值（可选，不填则自动获取）
   BAIDU_ACCOUNTS - 账号密码登录，格式: 手机号#密码，多账号用 & 分隔
-  STOKEN        - STOKEN Cookie值（可选），多账号用 & 分隔
 
 定时建议：
   0 8 * * *  (每天早上8点执行)
@@ -48,8 +55,12 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# 百度网盘会员成长体系API
-MEMBERSHIP_API = "https://pan.baidu.com/rest/2.0/membership/user"
+# 百度网盘API端点
+MEMBERSHIP_USER_API = "https://pan.baidu.com/rest/2.0/membership/user"
+MEMBERSHIP_LEVEL_API = "https://pan.baidu.com/rest/2.0/membership/level"
+XNAS_API = "https://pan.baidu.com/rest/2.0/xpan/nas"
+LOGIN_STATUS_API = "https://pan.baidu.com/api/loginStatus"
+PCS_PLANTCOOKIE_API = "https://pcs.baidu.com/rest/2.0/pcs/file"
 
 # 百度通行证登录API
 PASSPORT_GETAPI = "https://passport.baidu.com/v2/api/?getapi"
@@ -64,7 +75,6 @@ def load_notify():
         from notify import send
         return send
     except ImportError:
-        # 青龙面板外运行时的fallback
         def send(title, content):
             print(f"\n{'='*50}")
             print(f"  {title}")
@@ -89,12 +99,11 @@ def normalize_baidu_json(text):
 
     百度通行证API返回的数据混用单引号和双引号，
     例如: {"errno":'0',"pubkey":'-----BEGIN...'}
-    此函数将单引号字符串转为双引号，使其可被json.loads解析
     """
     result = []
     i = 0
-    in_dq = False  # 是否在双引号字符串内
-    in_sq = False  # 是否在单引号字符串内
+    in_dq = False
+    in_sq = False
     while i < len(text):
         char = text[i]
         if not in_sq and not in_dq:
@@ -131,22 +140,14 @@ def normalize_baidu_json(text):
 
 
 def parse_baidu_response(resp):
-    """
-    解析百度API响应，兼容标准JSON和非标准JSON（单引号）
-
-    Args:
-        resp: requests.Response对象
-
-    Returns:
-        dict: 解析后的字典
-    """
+    """解析百度API响应，兼容标准JSON和非标准JSON"""
     text = resp.text
-    # 尝试直接解析标准JSON
+    if not text or not text.strip():
+        return {}
     try:
         return resp.json()
     except (json.JSONDecodeError, ValueError):
         pass
-    # 尝试解析JSONP: callback({...})
     jsonp_match = re.search(r'\((\{.*\})\)', text, re.DOTALL)
     if jsonp_match:
         try:
@@ -156,40 +157,41 @@ def parse_baidu_response(resp):
                 return json.loads(normalize_baidu_json(jsonp_match.group(1)))
             except (json.JSONDecodeError, ValueError):
                 pass
-    # 尝试规范化后解析
     try:
         return json.loads(normalize_baidu_json(text))
     except (json.JSONDecodeError, ValueError):
         pass
-    # 全部失败，返回空字典
     return {}
+
 
 # ==================== 百度网盘签到核心类 ====================
 
 class BaiduPanCheckin:
-    """百度网盘签到类"""
+    """百度网盘签到类 - v3.0 多策略方案"""
 
     def __init__(self, bduss, stoken="", account_name=""):
-        """
-        初始化签到实例
-
-        Args:
-            bduss: BDUSS Cookie值
-            stoken: STOKEN Cookie值（可选）
-            account_name: 账号标识（用于日志）
-        """
         self.bduss = bduss
         self.stoken = stoken
         self.account_name = account_name or self._mask_bduss(bduss)
         self.session = requests.Session()
         self.bdstoken = ""
         self.uid = ""
+        self.username = ""
+        self.uk = ""
+        self.vip_type = 0
+        self.vip_level = 0
+        self.current_level = 0
+        self.current_growth = 0
+        self.history_level = 0
+        self.history_growth = 0
 
-        # 构建Cookie
-        cookie_str = f"BDUSS={bduss}"
-        if stoken:
-            cookie_str += f"; STOKEN={stoken}"
+        self._update_cookie()
 
+    def _update_cookie(self):
+        """更新Cookie头"""
+        cookie_str = f"BDUSS={self.bduss}"
+        if self.stoken:
+            cookie_str += f"; STOKEN={self.stoken}"
         self.session.headers.update({
             "User-Agent": USER_AGENT,
             "Accept": "application/json, text/plain, */*",
@@ -197,252 +199,257 @@ class BaiduPanCheckin:
             "Connection": "keep-alive",
             "Referer": "https://pan.baidu.com/",
             "Cookie": cookie_str,
+            "Accept-Encoding": "identity",
         })
 
     @staticmethod
     def _mask_bduss(bduss):
-        """脱敏BDUSS用于日志显示"""
         if len(bduss) <= 8:
             return "***"
         return f"{bduss[:4]}...{bduss[-4:]}"
 
-    def _build_params(self, method):
-        """构建API通用参数"""
-        return {
-            "method": method,
-            "clienttype": CLIENT_TYPE,
-            "app_id": APP_ID,
-            "web": WEB_FLAG,
-        }
-
-    def _request(self, method_name, http_method="GET", extra_params=None, data=None):
-        """
-        发送API请求
-
-        Args:
-            method_name: API方法名 (query_info / sign / task_list)
-            http_method: HTTP方法
-            extra_params: 额外参数
-            data: POST数据
-
-        Returns:
-            dict: API响应JSON
-        """
-        params = self._build_params(method_name)
-        if extra_params:
-            params.update(extra_params)
-
-        url = MEMBERSHIP_API
-
+    def _get_stoken(self):
+        """通过BDUSS自动获取STOKEN（使用PCS API）"""
+        if self.stoken:
+            return True
         try:
-            if http_method.upper() == "GET":
-                resp = self.session.get(url, params=params, timeout=15)
+            log(f"[{self.account_name}] 自动获取STOKEN...")
+            resp = self.session.get(
+                PCS_PLANTCOOKIE_API,
+                params={"method": "plantcookie", "type": "stoken", "source": "pcs"},
+                timeout=15,
+            )
+            stoken = self.session.cookies.get("STOKEN", "")
+            if stoken:
+                self.stoken = stoken
+                self._update_cookie()
+                log(f"[{self.account_name}] STOKEN获取成功: {stoken[:12]}...")
+                return True
             else:
-                resp = self.session.post(url, params=params, data=data, timeout=15)
-
-            resp.raise_for_status()
-            result = resp.json()
-            return result
-
-        except requests.exceptions.Timeout:
-            log(f"[{self.account_name}] 请求超时: {method_name}", "ERROR")
-            return {"errno": -1, "errmsg": "请求超时"}
-        except requests.exceptions.ConnectionError:
-            log(f"[{self.account_name}] 网络连接失败: {method_name}", "ERROR")
-            return {"errno": -2, "errmsg": "网络连接失败"}
-        except requests.exceptions.HTTPError as e:
-            log(f"[{self.account_name}] HTTP错误: {e}", "ERROR")
-            return {"errno": -3, "errmsg": f"HTTP错误: {e}"}
-        except json.JSONDecodeError:
-            log(f"[{self.account_name}] 响应解析失败: {method_name}", "ERROR")
-            return {"errno": -4, "errmsg": "响应解析失败"}
+                log(f"[{self.account_name}] STOKEN获取失败（不影响基础功能）", "WARN")
+                return False
         except Exception as e:
-            log(f"[{self.account_name}] 未知异常: {e}", "ERROR")
-            return {"errno": -5, "errmsg": str(e)}
+            log(f"[{self.account_name}] STOKEN获取异常: {e}", "WARN")
+            return False
 
     def check_login(self):
-        """
-        验证BDUSS是否有效
-
-        Returns:
-            bool: 是否有效
-        """
-        result = self._request("query_info")
-        errno = result.get("errno", -1)
-
-        if errno == 0:
-            log(f"[{self.account_name}] BDUSS验证成功")
-            # 提取bdstoken和uid
-            data = result.get("data", {})
-            self.bdstoken = data.get("bdstoken", "")
-            self.uid = str(data.get("uid", ""))
-            return True
-        elif errno == -6:
-            log(f"[{self.account_name}] BDUSS已失效，请重新获取", "ERROR")
+        """验证BDUSS是否有效"""
+        try:
+            resp = self.session.get(
+                XNAS_API,
+                params={"method": "uinfo"},
+                timeout=15,
+            )
+            data = resp.json()
+            if data.get("errno", -1) == 0 or "netdisk_name" in data:
+                self.username = data.get("netdisk_name", "未知")
+                self.uk = str(data.get("uk", ""))
+                self.vip_type = data.get("vip_type", 0)
+                log(f"[{self.account_name}] BDUSS验证成功，用户: {self.username} (UK: {self.uk})")
+                # 尝试获取STOKEN
+                self._get_stoken()
+                # 获取bdstoken
+                self._get_bdstoken()
+                return True
+            else:
+                errno = data.get("errno", -1)
+                if errno == -6:
+                    log(f"[{self.account_name}] BDUSS已失效，请重新获取", "ERROR")
+                else:
+                    log(f"[{self.account_name}] BDUSS验证失败: errno={errno}", "WARN")
+                return False
+        except Exception as e:
+            log(f"[{self.account_name}] 验证异常: {e}", "ERROR")
             return False
-        else:
-            errmsg = result.get("errmsg", "未知错误")
-            log(f"[{self.account_name}] BDUSS验证失败: errno={errno}, {errmsg}", "WARN")
-            # 尝试继续签到
-            return errno not in [-6, -1, -2, -3, -4, -5]
 
-    def get_user_info(self):
-        """
-        获取用户成长信息
+    def _get_bdstoken(self):
+        """获取bdstoken"""
+        try:
+            resp = self.session.get(
+                LOGIN_STATUS_API,
+                params={"clienttype": "0", "app_id": APP_ID},
+                timeout=15,
+            )
+            data = resp.json()
+            self.bdstoken = data.get("login_info", {}).get("bdstoken", "")
+            login_info = data.get("login_info", {})
+            if login_info.get("username"):
+                self.username = login_info["username"]
+            if login_info.get("vip_level"):
+                self.vip_level = login_info["vip_level"]
+        except Exception:
+            pass
 
-        Returns:
-            dict: 用户信息
-        """
-        result = self._request("query_info")
-        errno = result.get("errno", -1)
+    def get_membership_info(self):
+        """获取会员信息（使用可用的API）"""
+        info = {}
+        # 1. 获取会员详细信息（method=query 可用）
+        try:
+            resp = self.session.get(
+                MEMBERSHIP_USER_API,
+                params={
+                    "method": "query",
+                    "clienttype": CLIENT_TYPE,
+                    "app_id": APP_ID,
+                    "bdstoken": self.bdstoken,
+                },
+                timeout=15,
+            )
+            if resp.text and resp.text.strip():
+                data = resp.json()
+                if data.get("error_code", -1) == 0:
+                    level_info = data.get("level_info", {})
+                    info["current_level"] = level_info.get("current_level", 0)
+                    info["current_growth"] = level_info.get("current_value", 0)
+                    info["history_level"] = level_info.get("history_level", 0)
+                    info["history_growth"] = level_info.get("history_value", 0)
+                    info["last_collect_time"] = level_info.get("last_manual_collection_time", 0)
 
-        if errno != 0:
-            log(f"[{self.account_name}] 获取用户信息失败: {result.get('errmsg', '未知错误')}", "WARN")
-            return {}
+                    # 解析user_tag
+                    user_tag_str = data.get("user_tag", "{}")
+                    try:
+                        user_tag = json.loads(user_tag_str) if isinstance(user_tag_str, str) else user_tag_str
+                    except (json.JSONDecodeError, TypeError):
+                        user_tag = {}
+                    info["is_vip"] = user_tag.get("is_vip", 0)
+                    info["is_svip"] = user_tag.get("is_svip", 0)
+                    info["is_svip_sign"] = user_tag.get("is_svip_sign", 0)
+                    info["is_listen_sign"] = user_tag.get("is_listen_sign", 0)
 
-        data = result.get("data", {})
+                    # 保存到实例
+                    self.current_level = info.get("current_level", 0)
+                    self.current_growth = info.get("current_growth", 0)
+                    self.history_level = info.get("history_level", 0)
+                    self.history_growth = info.get("history_growth", 0)
+        except Exception as e:
+            log(f"[{self.account_name}] 获取会员信息异常: {e}", "WARN")
 
-        # 提取关键信息
-        info = {
-            "uid": data.get("uid", ""),
-            "username": data.get("username", ""),
-            "level": data.get("level", "未知"),
-            "growth": data.get("growth", "未知"),
-            "growth_max": data.get("growth_max", "未知"),
-            "is_svip": data.get("is_svip", 0),
-            "is_vip": data.get("is_vip", 0),
-            "vip_expired": data.get("vip_expired", ""),
-            "svip_expired": data.get("svip_expired", ""),
-            "today_growth": data.get("today_growth", 0),
-            "is_sign": data.get("is_sign", 0),
-            "bdstoken": data.get("bdstoken", ""),
-            "sign_continuous_days": data.get("sign_continuous_days", 0),
-        }
+        # 2. 获取等级信息（membership/level?method=query 可用）
+        try:
+            resp = self.session.get(
+                MEMBERSHIP_LEVEL_API,
+                params={
+                    "method": "query",
+                    "bdstoken": self.bdstoken,
+                },
+                timeout=15,
+            )
+            if resp.text and resp.text.strip():
+                data = resp.json()
+                if data.get("error_code", -1) == 0:
+                    level_data = data.get("data", {})
+                    if level_data.get("current_level") is not None:
+                        info["current_level"] = level_data.get("current_level", info.get("current_level", 0))
+                        info["current_growth"] = level_data.get("current_value", info.get("current_growth", 0))
+                        self.current_level = info["current_level"]
+                        self.current_growth = info["current_growth"]
+        except Exception:
+            pass
 
-        self.bdstoken = info["bdstoken"]
-        self.uid = str(info["uid"])
+        # 3. 获取登录状态中的会员信息
+        try:
+            resp = self.session.get(
+                LOGIN_STATUS_API,
+                params={"clienttype": "0", "app_id": APP_ID},
+                timeout=15,
+            )
+            data = resp.json()
+            login_info = data.get("login_info", {})
+            info["username"] = login_info.get("username", self.username)
+            info["vip_level"] = login_info.get("vip_level", 0)
+            info["vip_point"] = login_info.get("vip_point", 0)
+            info["vip_type"] = login_info.get("vip_type", "0")
+        except Exception:
+            pass
 
         return info
 
+    def sign_attempt(self):
+        """
+        尝试签到
+
+        百度已于2024年底废弃Web端签到API。
+        membership/user?method=sign 返回200空响应。
+        本方法仍尝试调用，以防百度恢复该功能。
+        """
+        try:
+            self.session.headers.update({
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://pan.baidu.com",
+                "Referer": "https://pan.baidu.com/disk/home",
+                "X-Requested-With": "XMLHttpRequest",
+            })
+
+            resp = self.session.post(
+                MEMBERSHIP_USER_API,
+                params={
+                    "method": "sign",
+                    "clienttype": CLIENT_TYPE,
+                    "app_id": APP_ID,
+                    "web": WEB_FLAG,
+                    "bdstoken": self.bdstoken,
+                },
+                timeout=15,
+            )
+
+            if resp.text and resp.text.strip():
+                data = resp.json()
+                errno = data.get("errno", -1)
+                if errno == 0:
+                    return True, "签到成功", data
+                elif errno == 1 or "已签到" in str(data):
+                    return True, "今日已签到", data
+                elif errno == -6:
+                    return False, "BDUSS已失效", data
+                else:
+                    return False, f"签到返回errno={errno}", data
+            else:
+                # 空响应 = API已废弃
+                return False, "签到API返回空响应（百度已废弃Web端签到）", {}
+        except Exception as e:
+            return False, f"签到异常: {e}", {}
+
     def sign_in(self):
-        """
-        执行每日签到
-
-        Returns:
-            dict: 签到结果
-        """
-        # 先检查是否已签到
-        info = self.get_user_info()
-        if info and info.get("is_sign"):
-            log(f"[{self.account_name}] 今日已签到，无需重复签到")
-            return {
-                "success": True,
-                "already_signed": True,
-                "message": "今日已签到",
-                "info": info,
-            }
-
-        # 执行签到
-        extra_params = {}
-        if self.bdstoken:
-            extra_params["bdstoken"] = self.bdstoken
-
-        result = self._request("sign", http_method="POST", extra_params=extra_params)
-        errno = result.get("errno", -1)
-        errmsg = result.get("errmsg", "")
-
-        sign_result = {
-            "success": errno == 0,
-            "already_signed": False,
-            "message": "",
-            "info": info,
-        }
-
-        if errno == 0:
-            # 签到成功
-            data = result.get("data", {})
-            growth = data.get("growth", 0)
-            reward = data.get("reward", "")
-            sign_result["message"] = f"签到成功！获得 {growth} 成长值" + (f"，{reward}" if reward else "")
-            log(f"[{self.account_name}] {sign_result['message']}", "SUCCESS")
-
-            # 获取签到后的最新信息
-            new_info = self.get_user_info()
-            if new_info:
-                sign_result["info"] = new_info
-
-        elif errno == 1 or "已签到" in errmsg or "already" in errmsg.lower():
-            sign_result["already_signed"] = True
-            sign_result["success"] = True
-            sign_result["message"] = "今日已签到，无需重复签到"
-            log(f"[{self.account_name}] {sign_result['message']}")
-
-        elif errno == -6:
-            sign_result["message"] = "BDUSS已失效，请重新获取"
-            log(f"[{self.account_name}] {sign_result['message']}", "ERROR")
-
+        """执行签到"""
+        log(f"[{self.account_name}] 尝试签到...")
+        success, msg, data = self.sign_attempt()
+        if success:
+            log(f"[{self.account_name}] {msg}", "SUCCESS")
         else:
-            sign_result["message"] = f"签到失败: errno={errno}, {errmsg}"
-            log(f"[{self.account_name}] {sign_result['message']}", "ERROR")
-
-        return sign_result
-
-    def get_task_list(self):
-        """
-        获取任务列表
-
-        Returns:
-            list: 任务列表
-        """
-        result = self._request("task_list")
-        errno = result.get("errno", -1)
-
-        if errno != 0:
-            log(f"[{self.account_name}] 获取任务列表失败: {result.get('errmsg', '')}", "WARN")
-            return []
-
-        data = result.get("data", {})
-        tasks = data.get("tasks", data.get("list", []))
-        return tasks
+            log(f"[{self.account_name}] {msg}", "WARN")
+        return {"success": success, "message": msg, "data": data}
 
     def format_report(self, sign_result):
         """格式化签到报告"""
-        info = sign_result.get("info", {})
-
+        info = self.get_membership_info()
         lines = []
         lines.append(f"账号: {self.account_name}")
-        lines.append(f"状态: {sign_result['message']}")
+        if info.get("username"):
+            lines.append(f"用户名: {info['username']}")
 
-        if info:
+        vip_status = "普通用户"
+        if info.get("is_svip"):
+            vip_status = "超级会员(SVIP)"
+        elif info.get("is_vip"):
+            vip_status = "普通会员(VIP)"
+
+        lines.append(f"会员状态: {vip_status}")
+        lines.append(f"签到结果: {sign_result['message']}")
+
+        if info.get("current_level") is not None:
             lines.append("")
-            lines.append("── 用户信息 ──")
+            lines.append("── 成长值信息 ──")
+            lines.append(f"  当前等级: Lv.{info.get('current_level', 0)}")
+            lines.append(f"  当前成长值: {info.get('current_growth', 0)}")
+            if info.get("history_level"):
+                lines.append(f"  历史最高: Lv.{info.get('history_level', 0)} (成长值: {info.get('history_growth', 0)})")
 
-            if info.get("username"):
-                lines.append(f"  用户名: {info['username']}")
-
-            if info.get("level"):
-                lines.append(f"  等级: Lv.{info['level']}")
-
-            if info.get("growth") != "未知":
-                growth_max = info.get("growth_max", "未知")
-                if growth_max != "未知":
-                    lines.append(f"  成长值: {info['growth']}/{growth_max}")
-                else:
-                    lines.append(f"  成长值: {info['growth']}")
-
-            if info.get("sign_continuous_days"):
-                lines.append(f"  连续签到: {info['sign_continuous_days']}天")
-
-            vip_status = "普通用户"
-            if info.get("is_svip"):
-                vip_status = "超级会员(SVIP)"
-                if info.get("svip_expired"):
-                    lines.append(f"  SVIP到期: {info['svip_expired']}")
-            elif info.get("is_vip"):
-                vip_status = "普通会员(VIP)"
-                if info.get("vip_expired"):
-                    lines.append(f"  VIP到期: {info['vip_expired']}")
-            lines.append(f"  会员状态: {vip_status}")
+        if not sign_result["success"]:
+            lines.append("")
+            lines.append("── 说明 ──")
+            lines.append("  百度网盘已废弃Web端签到API，签到功能")
+            lines.append("  已迁移至百度网盘APP内。本脚本仍会每日")
+            lines.append("  尝试签到并监控会员成长值变化。")
 
         return "\n".join(lines)
 
@@ -450,7 +457,6 @@ class BaiduPanCheckin:
         """执行完整签到流程"""
         log(f"[{self.account_name}] 开始签到流程...")
 
-        # 验证登录
         if not self.check_login():
             return {
                 "success": False,
@@ -458,14 +464,9 @@ class BaiduPanCheckin:
                 "report": f"账号: {self.account_name}\n状态: BDUSS已失效，请重新获取",
             }
 
-        # 执行签到
         sign_result = self.sign_in()
-
-        # 生成报告
         report = self.format_report(sign_result)
-
         log(f"[{self.account_name}] 签到流程完成")
-
         return {
             "success": sign_result["success"],
             "message": sign_result["message"],
@@ -476,19 +477,7 @@ class BaiduPanCheckin:
 # ==================== 百度账号密码登录 ====================
 
 def login_baidu(username, password):
-    """
-    通过账号密码登录百度，获取BDUSS
-
-    注意：百度登录有风控机制，服务器IP可能触发设备验证或短信验证。
-    如遇验证，请改用BDUSS方式（推荐）。
-
-    Args:
-        username: 手机号或用户名
-        password: 密码
-
-    Returns:
-        tuple: (bduss, stoken, message) 登录成功返回Cookie值，失败返回错误信息
-    """
+    """通过账号密码登录百度，获取BDUSS"""
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
@@ -496,59 +485,41 @@ def login_baidu(username, password):
         "Referer": "https://pan.baidu.com/",
     })
 
-    # Step 0: 访问百度网盘首页，获取初始Cookie（BAIDUID等）
     try:
         session.get("https://pan.baidu.com/", timeout=15)
-        log("访问百度网盘首页，获取初始Cookie")
     except Exception:
-        log("访问百度网盘首页失败，继续尝试登录", "WARN")
+        pass
 
     ts = str(int(time.time() * 1000))
 
-    # Step 1: 获取登录token
+    # 获取token
     try:
         resp = session.get(PASSPORT_GETAPI, params={
-            "tpl": "pp",
-            "apiver": "v3",
-            "class": "login",
-            "logintype": "dialogLogin",
-            "tt": ts,
-            "_": ts,
+            "tpl": "pp", "apiver": "v3", "class": "login",
+            "logintype": "dialogLogin", "tt": ts, "_": ts,
         }, timeout=15)
-
         data = parse_baidu_response(resp)
         token = data.get("data", {}).get("token", "")
-
         if not token:
             return None, None, "获取登录token失败"
-
         log(f"获取token成功: {token[:8]}...")
-
     except Exception as e:
         return None, None, f"获取token异常: {e}"
 
-    # Step 2: 获取RSA公钥
+    # 获取RSA公钥
     try:
         resp = session.get(PASSPORT_PUBKEY, params={
-            "tpl": "pp",
-            "apiver": "v3",
-            "tt": ts,
-            "_": ts,
+            "tpl": "pp", "apiver": "v3", "tt": ts, "_": ts,
         }, timeout=15)
-
         data = parse_baidu_response(resp)
         pubkey_pem = data.get("pubkey", "")
-        key = data.get("key", "")
-
         if not pubkey_pem:
             return None, None, "获取RSA公钥失败"
-
         log("获取RSA公钥成功")
-
     except Exception as e:
         return None, None, f"获取公钥异常: {e}"
 
-    # Step 3: RSA加密密码
+    # RSA加密密码
     try:
         encrypted_password = rsa_encrypt_password(password, pubkey_pem)
         if not encrypted_password:
@@ -557,36 +528,19 @@ def login_baidu(username, password):
     except Exception as e:
         return None, None, f"密码加密异常: {e}"
 
-    # Step 4: 提交登录
+    # 提交登录
     try:
         ts2 = str(int(time.time() * 1000))
         login_data = {
-            "staticpage": "https://pan.baidu.com/",
-            "charset": "utf-8",
-            "token": token,
-            "tpl": "pp",
-            "apiver": "v3",
-            "tt": ts2,
-            "codestring": "",
-            "safeflg": "0",
-            "u": "https://pan.baidu.com/",
-            "isPhone": "false",
-            "quickuser": "0",
-            "logintype": "dialogLogin",
-            "logLoginType": "pc_loginDialog",
-            "idc": "",
-            "loginmerge": "true",
-            "username": username,
-            "password": encrypted_password,
-            "verifycode": "",
-            "mem_pass": "on",
-            "ppui_logintime": ts2,
+            "staticpage": "https://pan.baidu.com/", "charset": "utf-8",
+            "token": token, "tpl": "pp", "apiver": "v3", "tt": ts2,
+            "codestring": "", "safeflg": "0", "u": "https://pan.baidu.com/",
+            "isPhone": "false", "quickuser": "0", "logintype": "dialogLogin",
+            "logLoginType": "pc_loginDialog", "idc": "", "loginmerge": "true",
+            "username": username, "password": encrypted_password,
+            "verifycode": "", "mem_pass": "on", "ppui_logintime": ts2,
         }
-
         resp = session.post(PASSPORT_LOGIN, data=login_data, timeout=15)
-        text = resp.text
-
-        # 从Cookie中提取BDUSS
         cookies = session.cookies.get_dict()
         bduss = cookies.get("BDUSS", "")
         stoken = cookies.get("STOKEN", "")
@@ -595,64 +549,30 @@ def login_baidu(username, password):
             log(f"登录成功！BDUSS: {bduss[:8]}...")
             return bduss, stoken, "登录成功"
 
-        # BDUSS未获取到，分析错误原因
-        # 百度登录失败时返回HTML页面，错误信息在URL参数中
-        err_no_match = re.search(r'err_no[=:]\s*(\d+)', text)
-        err_no = err_no_match.group(1) if err_no_match else ""
-
-        # 尝试从JSON响应中解析
-        if not err_no:
-            result = parse_baidu_response(resp)
-            err_info = result.get("errInfo", {})
-            err_no = err_info.get("no", "-1")
-
-        # 错误码映射
         error_map = {
-            "0": "登录成功",
             "400023": "需要验证码，请使用BDUSS方式登录",
             "400034": "需要短信验证码，请使用BDUSS方式登录",
-            "50052": "触发设备验证（服务器IP风控），请使用BDUSS方式登录",
+            "50052": "触发设备验证(服务器IP风控)，请使用BDUSS方式登录",
             "500001": "需要短信验证，请使用BDUSS方式登录",
             "160002": "账号或密码错误，请检查",
-            "120016": "账号异常，请联系百度客服",
-            "50031": "需要邮箱验证，请使用BDUSS方式登录",
         }
-
+        err_no_match = re.search(r'err_no[=:]\s*(\d+)', resp.text)
+        err_no = err_no_match.group(1) if err_no_match else ""
         err_msg = error_map.get(err_no, f"登录失败: errNo={err_no}")
         if not err_no:
-            err_msg = f"登录失败（未知错误），请使用BDUSS方式登录"
-
-        # 检查是否需要验证码
-        codestring_match = re.search(r'codeString[=:]\s*([^&\s"\']+)', text)
-        if codestring_match and codestring_match.group(1):
-            err_msg = f"需要验证码（{codestring_match.group(1)}），请使用BDUSS方式登录"
-
+            err_msg = "登录失败(未知错误)，请使用BDUSS方式登录"
         log(f"登录失败: {err_msg}", "WARN")
         return None, None, err_msg
-
     except Exception as e:
         return None, None, f"登录请求异常: {e}"
 
 
 def rsa_encrypt_password(password, pubkey_pem):
-    """
-    使用RSA公钥加密密码
-
-    Args:
-        password: 明文密码
-        pubkey_pem: PEM格式的RSA公钥（可能含转义的\\n）
-
-    Returns:
-        str: Base64编码的加密密码，失败返回None
-    """
-    # 处理转义字符（百度API返回的pubkey中\n是字面量）
+    """RSA加密密码"""
     pubkey_pem = pubkey_pem.replace("\\n", "\n")
-
-    # 确保PEM格式正确
     if "BEGIN PUBLIC KEY" not in pubkey_pem:
         pubkey_pem = "-----BEGIN PUBLIC KEY-----\n" + pubkey_pem + "\n-----END PUBLIC KEY-----"
 
-    # 尝试使用rsa库
     try:
         import rsa as rsa_lib
         pubkey = rsa_lib.PublicKey.load_pkcs1_openssl_pem(pubkey_pem.encode())
@@ -661,7 +581,6 @@ def rsa_encrypt_password(password, pubkey_pem):
     except ImportError:
         pass
 
-    # 尝试使用pycryptodome
     try:
         from Crypto.PublicKey import RSA
         from Crypto.Cipher import PKCS1_v1_5
@@ -672,29 +591,21 @@ def rsa_encrypt_password(password, pubkey_pem):
     except ImportError:
         pass
 
-    log("RSA加密失败：缺少rsa或pycryptodome库，请执行 pip install rsa", "ERROR")
+    log("RSA加密失败：缺少rsa或pycryptodome库", "ERROR")
     return None
 
 
 # ==================== 主函数 ====================
 
 def parse_accounts():
-    """
-    从环境变量解析账号信息
-
-    Returns:
-        list: 账号列表 [{bduss, stoken, name, type}, ...]
-    """
+    """从环境变量解析账号信息"""
     accounts = []
-
-    # 优先读取BDUSS（推荐方式）
     bduss_str = os.environ.get("BDUSS", "").strip()
     stoken_str = os.environ.get("STOKEN", "").strip()
 
     if bduss_str:
         bduss_list = re.split(r'[&\n]', bduss_str)
         bduss_list = [b.strip() for b in bduss_list if b.strip()]
-
         stoken_list = []
         if stoken_str:
             stoken_list = re.split(r'[&\n]', stoken_str)
@@ -703,31 +614,23 @@ def parse_accounts():
         for i, bduss in enumerate(bduss_list):
             stoken = stoken_list[i] if i < len(stoken_list) else ""
             accounts.append({
-                "type": "bduss",
-                "bduss": bduss,
-                "stoken": stoken,
+                "type": "bduss", "bduss": bduss, "stoken": stoken,
                 "name": f"BDUSS账号{i+1}",
             })
 
-    # 读取账号密码（备选方式）
     accounts_str = os.environ.get("BAIDU_ACCOUNTS", "").strip()
     if accounts_str:
         account_list = re.split(r'[&\n]', accounts_str)
         account_list = [a.strip() for a in account_list if a.strip()]
-
         for i, account in enumerate(account_list):
             parts = account.split("#")
             if len(parts) >= 2:
-                username = parts[0].strip()
-                password = parts[1].strip()
                 accounts.append({
                     "type": "login",
-                    "username": username,
-                    "password": password,
+                    "username": parts[0].strip(),
+                    "password": parts[1].strip(),
                     "name": f"账号密码{i+1}",
                 })
-            else:
-                log(f"账号密码格式错误: {account}（格式应为 手机号#密码）", "WARN")
 
     return accounts
 
@@ -736,12 +639,11 @@ def main():
     """主函数"""
     print("""
 ╔══════════════════════════════════════════╗
-║     百度网盘自动签到 (青龙面板版)        ║
-║     Baidu Pan Auto Check-in for QL      ║
+║   百度网盘自动签到 (青龙面板版) v3.0      ║
+║   自动STOKEN + 会员信息监控 + 签到尝试   ║
 ╚══════════════════════════════════════════╝
     """)
 
-    # 解析账号
     accounts = parse_accounts()
 
     if not accounts:
@@ -772,16 +674,13 @@ def main():
 
         try:
             if account["type"] == "bduss":
-                # BDUSS方式
                 checkin = BaiduPanCheckin(
                     bduss=account["bduss"],
                     stoken=account.get("stoken", ""),
                     account_name=account["name"],
                 )
                 result = checkin.run()
-
             elif account["type"] == "login":
-                # 账号密码登录方式
                 username = account["username"]
                 password = account["password"]
                 account_label = f"{username[:3]}****{username[-4:]}" if len(username) >= 7 else username
@@ -792,9 +691,7 @@ def main():
                 if bduss:
                     log(f"[{account_label}] {login_msg}")
                     checkin = BaiduPanCheckin(
-                        bduss=bduss,
-                        stoken=stoken,
-                        account_name=account_label,
+                        bduss=bduss, stoken=stoken, account_name=account_label,
                     )
                     result = checkin.run()
                 else:
@@ -804,7 +701,6 @@ def main():
                         "message": login_msg,
                         "report": f"账号: {account_label}\n状态: {login_msg}",
                     }
-
             else:
                 continue
 
@@ -821,10 +717,8 @@ def main():
             reports.append(f"账号: {account['name']}\n状态: {err_msg}")
             fail_count += 1
 
-        # 多账号间隔，避免请求过快
         time.sleep(2)
 
-    # 汇总通知
     log(f"\n{'═'*40}")
     log(f"签到完成: 成功 {success_count} 个, 失败 {fail_count} 个")
 
@@ -832,7 +726,6 @@ def main():
         f"签到完成: 成功 {success_count}/{len(accounts)}\n\n"
         + "\n\n──────────\n\n".join(reports)
     )
-
     notify_send("百度网盘签到通知", summary)
 
 

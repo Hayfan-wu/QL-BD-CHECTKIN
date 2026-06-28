@@ -2,14 +2,26 @@
 
 适用于 [青龙面板](https://github.com/whyour/qinglong) 的百度网盘每日自动签到脚本。
 
+## ⚠️ 重要说明
+
+> 百度网盘已于2024年底废弃了Web端签到API（`membership/user?method=sign` 返回200空响应）。
+> 签到功能已迁移至**百度网盘APP**内的任务中心。
+>
+> 本脚本仍会每日尝试调用签到API（以防百度恢复），同时提供以下功能：
+> - **BDUSS有效性验证** - 自动检测Cookie是否有效
+> - **STOKEN自动获取** - 通过BDUSS调用PCS API自动获取STOKEN（无需手动配置）
+> - **会员信息监控** - 获取当前等级、成长值、会员状态
+> - **签到尝试** - 每日尝试调用签到API
+
 ## 功能特性
 
-- 每日签到获取成长值，提升会员等级
-- 支持BDUSS Cookie认证（推荐，稳定可靠）
+- 自动获取STOKEN（通过BDUSS调用PCS API，无需手动配置）
+- BDUSS Cookie认证（推荐，稳定可靠）
 - 支持账号密码自动登录获取BDUSS
-- 查询用户信息（等级、成长值、会员状态等）
+- 会员信息查询（等级、成长值、会员状态）
 - 支持多账号批量签到
 - 青龙面板通知推送（支持多种通知渠道）
+- 完善的错误处理和状态报告
 
 ## 快速开始
 
@@ -37,7 +49,7 @@ pip install requests rsa
 | 变量名 | 值 | 说明 |
 |--------|-----|------|
 | `BDUSS` | 你的BDUSS值 | 多账号用 `&` 分隔 |
-| `STOKEN` | 你的STOKEN值（可选） | 多账号用 `&` 分隔，与BDUSS一一对应 |
+| `STOKEN` | 你的STOKEN值（可选） | 不填则自动获取 |
 
 #### 方式二：账号密码
 
@@ -52,12 +64,14 @@ pip install requests rsa
 在青龙面板 → 定时任务中添加：
 
 | 字段 | 值 |
-|------|-----|
+|------|------|
 | 名称 | 百度网盘签到 |
 | 命令 | `task baidu_pan_checkin.py` |
 | 定时规则 | `0 8 * * *` |
 
 ### 4. 获取BDUSS
+
+#### 方法一：浏览器开发者工具（推荐）
 
 1. 浏览器访问 [pan.baidu.com](https://pan.baidu.com) 并登录
 2. 按 `F12` 打开开发者工具
@@ -66,36 +80,64 @@ pip install requests rsa
 5. 找到 `BDUSS` 条目，复制其值
 6. 将值填入青龙面板环境变量 `BDUSS`
 
-## 文件说明
+#### 方法二：Chrome浏览器插件
 
-```
-QL-BD-CHECKIN/
-├── baidu_pan_checkin.py   # 主签到脚本
-├── qr_login.py           # 扫码登录获取BDUSS工具
-├── requirements.txt       # Python依赖
-├── GET_BDUSS.md          # BDUSS获取方法文档
-└── README.md             # 说明文档
-```
+本仓库包含一个Chrome/Edge浏览器插件，可一键获取BDUSS：
 
-## 获取 BDUSS
+1. 下载 `bduss-extension/` 文件夹
+2. Chrome打开 `chrome://extensions/`
+3. 开启"开发者模式"
+4. 点击"加载已解压的扩展程序"，选择 `bduss-extension/` 文件夹
+5. 访问 [pan.baidu.com](https://pan.baidu.com) 并登录
+6. 点击插件图标，自动提取BDUSS
 
-首次使用需要获取 BDUSS，详见 [GET_BDUSS.md](GET_BDUSS.md)。
-
-推荐在本地电脑运行 `qr_login.py` 扫码登录自动获取：
+#### 方法三：扫码登录工具
 
 ```bash
 pip install requests qrcode
 python3 qr_login.py
 ```
 
-## 签到机制
+> 注意：扫码登录需在本地电脑运行（服务器IP可能触发百度风控）
 
-百度网盘签到属于"会员成长体系"，每日签到可获得成长值，成长值用于提升会员等级。等级越高可享受更多权益：
+## 文件说明
 
-- 存储空间扩容
-- 极速下载券
-- 在线解压券
-- 网盘SVIP体验
+```
+QL-BD-CHECKIN/
+├── baidu_pan_checkin.py   # 主签到脚本 (v3.0)
+├── qr_login.py            # 扫码登录获取BDUSS工具
+├── bduss-extension/       # Chrome浏览器插件
+│   ├── manifest.json
+│   ├── popup.html
+│   ├── popup.js
+│   └── icons/
+├── requirements.txt       # Python依赖
+├── GET_BDUSS.md          # BDUSS获取方法文档
+└── README.md             # 说明文档
+```
+
+## 通知示例
+
+脚本执行后会推送如下通知：
+
+```
+签到完成: 成功 0/1
+
+账号: BDUSS账号1
+用户名: 也许曾经那么
+会员状态: 普通用户
+签到结果: 签到API返回空响应（百度已废弃Web端签到）
+
+── 成长值信息 ──
+  当前等级: Lv.1
+  当前成长值: 440
+  历史最高: Lv.2 (成长值: 1170)
+
+── 说明 ──
+  百度网盘已废弃Web端签到API，签到功能
+  已迁移至百度网盘APP内。本脚本仍会每日
+  尝试签到并监控会员成长值变化。
+```
 
 ## 定时规则说明
 
@@ -115,16 +157,17 @@ python3 qr_login.py
 
 BDUSS有效期较长，但可能会因修改密码、异地登录等原因失效。失效后请重新登录百度网盘获取新的BDUSS。
 
+### 签到显示"API返回空响应"？
+
+这是正常的。百度已废弃Web端签到API，签到功能已迁移至百度网盘APP。本脚本仍会每日尝试签到并监控会员成长值变化。
+
 ### 账号密码登录提示需要验证码？
 
 百度登录有风控机制，频繁登录或新设备可能触发验证码。建议使用BDUSS方式，更稳定可靠。
 
-### 签到失败怎么办？
+### STOKEN需要手动配置吗？
 
-1. 检查BDUSS是否有效
-2. 检查网络连接
-3. 查看日志中的错误信息
-4. 尝试手动签到确认账号状态
+不需要。脚本会通过BDUSS自动调用PCS API获取STOKEN。如果你已有STOKEN，也可以通过环境变量手动配置。
 
 ## 免责声明
 
