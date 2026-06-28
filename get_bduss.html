@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BDUSS 一键提取工具</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: #fff;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .step {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 15px 20px;
+            margin-bottom: 15px;
+            border-radius: 8px;
+        }
+        .step-num {
+            display: inline-block;
+            background: #667eea;
+            color: #fff;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+            text-align: center;
+            border-radius: 50%;
+            font-size: 12px;
+            font-weight: bold;
+            margin-right: 8px;
+        }
+        .step-text { color: #555; font-size: 15px; line-height: 1.6; }
+        .result-box {
+            background: #1a1a2e;
+            color: #00ff88;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            word-break: break-all;
+            margin: 15px 0;
+            min-height: 50px;
+            display: none;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 10px;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+        }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102,126,234,0.4); }
+        .btn-copy {
+            background: #28a745;
+            color: #fff;
+        }
+        .btn-copy:hover { background: #218838; }
+        .alert {
+            padding: 12px 20px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        .alert-warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .bookmarklet {
+            display: inline-block;
+            background: #ffc107;
+            color: #333;
+            padding: 8px 16px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            border: 2px dashed #333;
+        }
+        .bookmarklet:hover { background: #ffb300; }
+        .hidden { display: none !important; }
+        .link {
+            color: #667eea;
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔑 BDUSS 一键提取工具</h1>
+        <p class="subtitle">百度网盘 Cookie 自动获取</p>
+
+        <div id="notLoggedIn" class="alert alert-warning">
+            ⚠️ 请先确保你已在浏览器中登录 <a href="https://pan.baidu.com" target="_blank" class="link">百度网盘</a>
+        </div>
+
+        <div class="step">
+            <span class="step-num">1</span>
+            <span class="step-text">确保已登录百度网盘（<a href="https://pan.baidu.com" target="_blank" class="link">点击登录</a>）</span>
+        </div>
+        <div class="step">
+            <span class="step-num">2</span>
+            <span class="step-text">点击下方「一键提取 BDUSS」按钮</span>
+        </div>
+        <div class="step">
+            <span class="step-num">3</span>
+            <span class="step-text">复制提取到的 BDUSS 值，填入青龙面板环境变量</span>
+        </div>
+
+        <button class="btn btn-primary" onclick="extractBDUSS()">
+            🔍 一键提取 BDUSS
+        </button>
+
+        <div id="resultBox" class="result-box"></div>
+
+        <button id="copyBtn" class="btn btn-copy hidden" onclick="copyBDUSS()">
+            📋 复制 BDUSS
+        </button>
+
+        <div id="alertBox"></div>
+
+        <hr style="margin: 25px 0; border: none; border-top: 1px solid #eee;">
+
+        <p style="font-size: 13px; color: #888; margin-bottom: 10px;">
+            <strong>💡 备用方法（书签法）：</strong><br>
+            将下方按钮拖到浏览器书签栏，在百度网盘页面点击书签即可提取：
+        </p>
+        <a class="bookmarklet" href="javascript:void((function(){var c=document.cookie.match(/BDUSS=([^;]+)/);if(c){prompt('你的BDUSS（请复制）：',c[1])}else{alert('未找到BDUSS，请确保已登录百度网盘')}})())">
+            📑 提取BDUSS书签
+        </a>
+
+        <p style="font-size: 12px; color: #aaa; margin-top: 20px; text-align: center;">
+            此工具仅在本地浏览器运行，不会上传任何数据
+        </p>
+    </div>
+
+    <script>
+        function extractBDUSS() {
+            var resultBox = document.getElementById('resultBox');
+            var copyBtn = document.getElementById('copyBtn');
+            var alertBox = document.getElementById('alertBox');
+
+            // 尝试从cookie中读取BDUSS
+            var cookies = document.cookie;
+            var bdussMatch = cookies.match(/BDUSS=([^;]+)/);
+
+            if (bdussMatch && bdussMatch[1]) {
+                var bduss = bdussMatch[1];
+                resultBox.textContent = 'BDUSS=' + bduss;
+                resultBox.style.display = 'block';
+                copyBtn.classList.remove('hidden');
+                alertBox.innerHTML = '<div class="alert alert-success">✅ BDUSS 提取成功！请点击下方按钮复制</div>';
+                
+                // 自动复制到剪贴板
+                navigator.clipboard.writeText(bduss).then(function() {
+                    alertBox.innerHTML = '<div class="alert alert-success">✅ BDUSS 提取成功！已自动复制到剪贴板</div>';
+                }).catch(function() {
+                    alertBox.innerHTML = '<div class="alert alert-success">✅ BDUSS 提取成功！请点击下方按钮手动复制</div>';
+                });
+            } else {
+                // BDUSS可能是httpOnly，尝试通过API获取
+                alertBox.innerHTML = '<div class="alert alert-warning">⏳ Cookie中未找到BDUSS，尝试通过API获取...</div>';
+                
+                // 尝试访问百度网盘API
+                fetch('https://pan.baidu.com/rest/2.0/membership/user?method=query_info&clienttype=0&app_id=250528&web=1', {
+                    credentials: 'include'
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.errno === 0) {
+                        alertBox.innerHTML = '<div class="alert alert-success">✅ 账号已登录！但BDUSS是HttpOnly Cookie，无法通过JavaScript直接读取</div>';
+                        resultBox.textContent = '你的账号已登录: ' + (data.data.username || '未知') + '\n\nBDUSS是HttpOnly Cookie，无法通过页面提取。\n请按以下手动方法获取：\n\n1. 按 F12 打开开发者工具\n2. 点击 Application（应用程序）标签\n3. 左侧 Cookies → https://pan.baidu.com\n4. 找到 BDUSS，复制其值';
+                        resultBox.style.display = 'block';
+                    } else {
+                        alertBox.innerHTML = '<div class="alert alert-error">❌ 未登录百度网盘，请先<a href="https://pan.baidu.com" target="_blank" class="link">登录</a></div>';
+                    }
+                })
+                .catch(() => {
+                    alertBox.innerHTML = '<div class="alert alert-error">❌ 无法访问百度网盘API，请确保在 pan.baidu.com 页面使用此工具</div>';
+                });
+            }
+        }
+
+        function copyBDUSS() {
+            var text = document.getElementById('resultBox').textContent;
+            var bduss = text.replace('BDUSS=', '');
+            navigator.clipboard.writeText(bduss).then(function() {
+                alert('已复制到剪贴板！');
+            }).catch(function() {
+                // 备用方法
+                var textarea = document.createElement('textarea');
+                textarea.value = bduss;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                alert('已复制到剪贴板！');
+            });
+        }
+    </script>
+</body>
+</html>
